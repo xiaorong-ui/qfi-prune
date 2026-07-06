@@ -519,11 +519,13 @@ case "${PROFILE}" in
             "EC_SOLVER=greedy"
         )
         ;;
-    qficr_tune_baseline|qficr_tune_alpha_050|qficr_tune_alpha_075|qficr_tune_alpha_125|qficr_tune_prior_lam_010|qficr_tune_prior_lam_025|qficr_tune_prior_lam_050|qficr_tune_alpha050_prior010|qficr_tune_alpha075_prior010|qficr_tune_rho_max_down|qficr_tune_rho_max_up|qficr_tune_cap_down|qficr_tune_cap_up|qficr_tune_debug_prior_stats|qficr_ksens_stable|qficr_ksens_only_reduction|qficr_micro_baseline|qficr_micro_beta_075|qficr_micro_beta_125|qficr_micro_beta_150|qficr_micro_tau_085|qficr_micro_tau_115|qficr_micro_tau_130|qficr_micro_div_010|qficr_micro_yn_gate_05)
+    qficr_tune_baseline|qficr_tune_alpha_050|qficr_tune_alpha_075|qficr_tune_alpha_125|qficr_tune_prior_lam_010|qficr_tune_prior_lam_025|qficr_tune_prior_lam_050|qficr_tune_alpha050_prior010|qficr_tune_alpha075_prior010|qficr_tune_rho_max_down|qficr_tune_rho_max_up|qficr_tune_cap_down|qficr_tune_cap_up|qficr_tune_debug_prior_stats|qficr_ksens_stable|qficr_ksens_only_reduction|qficr_micro_baseline|qficr_micro_beta_075|qficr_micro_beta_125|qficr_micro_beta_150|qficr_micro_tau_085|qficr_micro_tau_115|qficr_micro_tau_130|qficr_micro_div_010|qficr_micro_yn_gate_05|qficr_general_baseline_last2|qficr_general_entropy_anchor_005|qficr_general_entropy_anchor_010|qficr_general_residual_budget_050|qficr_general_residual_budget_075|qficr_general_cls_last4_avg|qficr_general_cls_last1_avg)
         if [[ "${PROFILE}" == qficr_ksens_* ]]; then
             QFICR_TUNING="ksens_${PROFILE#qficr_ksens_}"
         elif [[ "${PROFILE}" == qficr_micro_* ]]; then
             QFICR_TUNING="micro_${PROFILE#qficr_micro_}"
+        elif [[ "${PROFILE}" == qficr_general_* ]]; then
+            QFICR_TUNING="general_${PROFILE#qficr_general_}"
         else
             QFICR_TUNING="${PROFILE#qficr_tune_}"
         fi
@@ -540,6 +542,10 @@ case "${PROFILE}" in
         QFICR_RESTORE_DIV_LAMBDA="0.0"
         QFICR_RESTORE_CANDIDATE_FACTOR="2.0"
         QFICR_YN_BUDGET_GATE="1.0"
+        QFICR_ENTROPY_ANCHOR_RATIO="0.0"
+        QFICR_RESIDUAL_BUDGET_GAMMA="-1.0"
+        QFICR_CLS_PRIOR_LAYERS="last2"
+        QFICR_CLS_ATTN_LAYER="-2"
         case "${PROFILE}" in
             qficr_ksens_only_reduction)
                 QFICR_RESTORATION_MODE="none"
@@ -568,6 +574,26 @@ case "${PROFILE}" in
                 ;;
             qficr_micro_yn_gate_05)
                 QFICR_YN_BUDGET_GATE="0.5"
+                ;;
+            qficr_general_entropy_anchor_005)
+                QFICR_ENTROPY_ANCHOR_RATIO="0.05"
+                ;;
+            qficr_general_entropy_anchor_010)
+                QFICR_ENTROPY_ANCHOR_RATIO="0.10"
+                ;;
+            qficr_general_residual_budget_050)
+                QFICR_RESIDUAL_BUDGET_GAMMA="0.50"
+                ;;
+            qficr_general_residual_budget_075)
+                QFICR_RESIDUAL_BUDGET_GAMMA="0.75"
+                ;;
+            qficr_general_cls_last4_avg)
+                QFICR_CLS_PRIOR_LAYERS="last4"
+                QFICR_CLS_ATTN_LAYER="last4mean"
+                ;;
+            qficr_general_cls_last1_avg)
+                QFICR_CLS_PRIOR_LAYERS="last1"
+                QFICR_CLS_ATTN_LAYER="last"
                 ;;
             qficr_tune_alpha_075)
                 QFICR_ANCHOR_ALPHA="0.75"
@@ -629,7 +655,8 @@ case "${PROFILE}" in
             "EC_SCORE_SOURCE=qfid" "EC_QFID_SELECT_MODE=qf"
             "EC_QFID_PROB_SOURCE=clsmix"
             "EC_QFID_CLS_MIX_MODE=linear" "EC_QFID_CLS_MIX_BETA=0.105"
-            "EC_QFID_CLS_ATTN_LAYER=-2" "EC_QFID_CLS_HEAD_REDUCE=mean"
+            "EC_QFID_CLS_ATTN_LAYER=${QFICR_CLS_ATTN_LAYER}" "EC_QFID_CLS_HEAD_REDUCE=mean"
+            "EC_QFICR_CLS_PRIOR_LAYERS=${QFICR_CLS_PRIOR_LAYERS}"
             "EC_QFID_CLS_GATE=1" "EC_QFID_CLS_GATE_MODE=agreement"
             "EC_QFID_CLS_GATE_BETA_BASE=0.105"
             "EC_QFID_CLS_GATE_MIN=0.5" "EC_QFID_CLS_GATE_MAX=1.5"
@@ -666,6 +693,8 @@ case "${PROFILE}" in
             "EC_QFICR_RESTORE_DIV_LAMBDA=${QFICR_RESTORE_DIV_LAMBDA}"
             "EC_QFICR_RESTORE_CANDIDATE_FACTOR=${QFICR_RESTORE_CANDIDATE_FACTOR}"
             "EC_QFICR_YN_BUDGET_GATE=${QFICR_YN_BUDGET_GATE}"
+            "EC_QFICR_ENTROPY_ANCHOR_RATIO=${QFICR_ENTROPY_ANCHOR_RATIO}"
+            "EC_QFICR_RESIDUAL_BUDGET_GAMMA=${QFICR_RESIDUAL_BUDGET_GAMMA}"
             "EC_QFICR_RANDOM_SEED=${EC_QFICR_RANDOM_SEED:-42}"
             "EC_QFICR_DEBUG_PRIOR_STATS_JSONL=${QFICR_DEBUG_PRIOR_JSONL}"
             "EC_QFID_BUDGET_CALIB=0"

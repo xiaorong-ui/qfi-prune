@@ -586,6 +586,13 @@ def select_by_adaptive_core_recover(
             "spatial_prior_mean": 0.0,
             "local_prior_mean": 0.0,
             "spatial_local_prior_mean": 0.0,
+            "entropy_anchor_ratio": 0.0,
+            "entropy_anchor_count": 0,
+            "residual_budget_gamma": -1.0,
+            "residual_budget_applied": False,
+            "residual_mass": 0.0,
+            "k_core_original": 0,
+            "k_recover_original": 0,
         }
         return torch.empty(0, dtype=torch.long, device=device), info
 
@@ -671,6 +678,13 @@ def select_by_adaptive_core_recover(
         recover_ratio = float(recover_num) / max(float(select_num), 1.0)
         yn_gate_applied = True
 
+    psi = F.normalize(
+        torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0),
+        dim=-1,
+        eps=safe_eps,
+    )
+    evidence_kernel = compute_projection_overlap_kernel(psi, eps=safe_eps, assume_normalized=True)
+
     qfi_order = qfi_core_order.to(device=device, dtype=torch.long)
     qfi_order = qfi_order[(qfi_order >= 0) & (qfi_order < num_tokens)]
     if qfi_order.numel() > 0:
@@ -682,15 +696,81 @@ def select_by_adaptive_core_recover(
                 ordered_unique.append(int(idx))
         qfi_order = torch.tensor(ordered_unique, dtype=torch.long, device=device)
 
-    core_indices = qfi_order[:core_num] if core_num > 0 else torch.empty(0, dtype=torch.long, device=device)
-    selected = [int(idx) for idx in core_indices.tolist()]
+    entropy_anchor_ratio = min(max(_env_float("EC_QFICR_ENTROPY_ANCHOR_RATIO", "0.0"), 0.0), 1.0)
+    residual_budget_gamma = _env_float("EC_QFICR_RESIDUAL_BUDGET_GAMMA", "-1.0")
+    residual_budget_enabled = residual_budget_gamma > 0.0 and restoration_mode == "full"
+    k_core_original = int(core_num)
+    k_recover_original = int(recover_num)
+    entropy_anchor_count = 0
+    residual_mass = 0.0
+    residual_budget_applied = False
 
-    psi = F.normalize(
-        torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0),
-        dim=-1,
-        eps=safe_eps,
-    )
-    evidence_kernel = compute_projection_overlap_kernel(psi, eps=safe_eps, assume_normalized=True)
+    def build_core_indices(target_core_num):
+        target_core_num = min(max(int(target_core_num), 0), select_num, num_tokens)
+        if target_core_num <= 0:
+            return torch.empty(0, dtype=torch.long, device=device), 0
+
+        # Fast path preserves the current stable QFi-CR behavior exactly unless
+        # one of the new generalization ablations is explicitly enabled.
+        if entropy_anchor_ratio <= 0.0 and not residual_budget_enabled:
+            return qfi_order[:target_core_num], 0
+
+        anchor_num = min(
+            max(int(round(entropy_anchor_ratio * float(select_num) * (1.0 - entropy_norm))), 0),
+            target_core_num,
+        )
+        selected_core = []
+        core_available = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        core_coverage = torch.zeros(num_tokens, dtype=evidence_kernel.dtype, device=device)
+        if anchor_num > 0:
+            anchor_idx = torch.topk(p, k=anchor_num).indices
+            selected_core.extend([int(x) for x in anchor_idx.tolist()])
+            core_available[anchor_idx] = False
+            core_coverage = evidence_kernel[:, anchor_idx].max(dim=1).values
+
+        # Entropy-aware core anchor protection: anchors initialize coverage, then
+        # the remaining reduction budget follows the original projection coverage
+        # objective over the uncovered residual mass.
+        while len(selected_core) < target_core_num and bool(core_available.any().item()):
+            core_gain = (p[:, None] * (evidence_kernel - core_coverage[:, None]).clamp_min(0.0)).sum(dim=0)
+            core_gain = torch.nan_to_num(core_gain.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            core_gain = core_gain.masked_fill(~core_available, float("-inf"))
+            idx = int(torch.argmax(core_gain).item())
+            if not bool(core_available[idx].item()):
+                break
+            selected_core.append(idx)
+            core_available[idx] = False
+            core_coverage = torch.maximum(core_coverage, evidence_kernel[:, idx])
+
+        if len(selected_core) < target_core_num:
+            filler = torch.nonzero(core_available, as_tuple=False).reshape(-1)
+            selected_core.extend([int(x) for x in filler[: target_core_num - len(selected_core)].tolist()])
+
+        return torch.tensor(selected_core[:target_core_num], dtype=torch.long, device=device), anchor_num
+
+    core_indices, entropy_anchor_count = build_core_indices(core_num)
+
+    if residual_budget_enabled and recover_num > 0:
+        if core_indices.numel() > 0:
+            tmp_coverage = evidence_kernel[:, core_indices].max(dim=1).values
+        else:
+            tmp_coverage = torch.zeros(num_tokens, dtype=evidence_kernel.dtype, device=device)
+        # Residual-mass restoration budget gating: only reduce recovery budget
+        # when the already reduced core explains most task-conditioned mass.
+        residual_mass = float((p * (1.0 - tmp_coverage.clamp(0.0, 1.0))).sum().clamp(0.0, 1.0).item())
+        recover_num_new = min(
+            max(int(round(float(residual_budget_gamma) * float(select_num) * residual_mass)), 0),
+            recover_num,
+            select_num,
+        )
+        if recover_num_new != recover_num:
+            residual_budget_applied = True
+            recover_num = recover_num_new
+            core_num = select_num - recover_num
+            recover_ratio = float(recover_num) / max(float(select_num), 1.0)
+            core_indices, entropy_anchor_count = build_core_indices(core_num)
+
+    selected = [int(idx) for idx in core_indices.tolist()]
 
     available = torch.ones(num_tokens, dtype=torch.bool, device=device)
     if core_indices.numel() > 0:
@@ -855,6 +935,13 @@ def select_by_adaptive_core_recover(
         "restore_candidate_factor": float(restore_candidate_factor),
         "yn_budget_gate": float(yn_budget_gate),
         "yn_gate_applied": bool(yn_gate_applied),
+        "entropy_anchor_ratio": float(entropy_anchor_ratio),
+        "entropy_anchor_count": int(entropy_anchor_count),
+        "residual_budget_gamma": float(residual_budget_gamma),
+        "residual_budget_applied": bool(residual_budget_applied),
+        "residual_mass": float(residual_mass),
+        "k_core_original": int(k_core_original),
+        "k_recover_original": int(k_recover_original),
         "random_seed": int(random_seed),
         "spatial_prior_mean": float(spatial_prior.mean().item()) if spatial_prior.numel() > 0 else 0.0,
         "local_prior_mean": float(local_prior.mean().item()) if local_prior.numel() > 0 else 0.0,
@@ -2290,6 +2377,16 @@ class ECPruner:
         self.qfid_cls_attn_layer = os.environ.get("EC_QFID_CLS_ATTN_LAYER", "last").strip().lower()
         if self.qfid_cls_attn_layer not in {"last", "-2", "-4", "last4mean"}:
             raise ValueError(f"Unknown EC_QFID_CLS_ATTN_LAYER: {self.qfid_cls_attn_layer}")
+        self.qficr_cls_prior_layers = os.environ.get("EC_QFICR_CLS_PRIOR_LAYERS", "").strip().lower()
+        if not self.qficr_cls_prior_layers:
+            if self.qfid_cls_attn_layer == "last":
+                self.qficr_cls_prior_layers = "last1"
+            elif self.qfid_cls_attn_layer == "last4mean":
+                self.qficr_cls_prior_layers = "last4"
+            else:
+                self.qficr_cls_prior_layers = "last2"
+        if self.qficr_cls_prior_layers not in {"last1", "last2", "last4"}:
+            raise ValueError(f"Unknown EC_QFICR_CLS_PRIOR_LAYERS: {self.qficr_cls_prior_layers}")
         self.qfid_cls_head_reduce = os.environ.get("EC_QFID_CLS_HEAD_REDUCE", "mean").strip().lower()
         if self.qfid_cls_head_reduce not in {"mean", "entropy_weighted"}:
             raise ValueError(f"Unknown EC_QFID_CLS_HEAD_REDUCE: {self.qfid_cls_head_reduce}")
@@ -2684,6 +2781,7 @@ class ECPruner:
         info = {
             "cls_attn_available": False,
             "cls_attn_layer": self.qfid_cls_attn_layer,
+            "cls_prior_layers": self.qficr_cls_prior_layers,
             "cls_head_reduce": self.qfid_cls_head_reduce,
             "cls_head_entropy_min": 0.0,
             "cls_head_entropy_max": 0.0,
@@ -2765,6 +2863,7 @@ class ECPruner:
             observation_mode = "full"
         cls_reduce_info = {
             "cls_attn_layer": self.qfid_cls_attn_layer,
+            "cls_prior_layers": self.qficr_cls_prior_layers,
             "cls_head_reduce": self.qfid_cls_head_reduce,
             "cls_head_entropy_min": 0.0,
             "cls_head_entropy_max": 0.0,
@@ -3021,6 +3120,7 @@ class ECPruner:
             "p_sem_entropy": p_sem_entropy,
             "p_cls_entropy": p_cls_entropy,
             "cls_attn_layer": cls_reduce_info["cls_attn_layer"],
+            "cls_prior_layers": cls_reduce_info["cls_prior_layers"],
             "cls_head_reduce": cls_reduce_info["cls_head_reduce"],
             "cls_head_entropy_min": cls_reduce_info["cls_head_entropy_min"],
             "cls_head_entropy_max": cls_reduce_info["cls_head_entropy_max"],
@@ -3821,6 +3921,7 @@ class ECPruner:
             "p_sem_entropy": prob_info["p_sem_entropy"],
             "p_cls_entropy": prob_info["p_cls_entropy"],
             "cls_attn_layer": prob_info["cls_attn_layer"],
+            "cls_prior_layers": prob_info["cls_prior_layers"],
             "cls_head_reduce": prob_info["cls_head_reduce"],
             "cls_head_entropy_min": prob_info["cls_head_entropy_min"],
             "cls_head_entropy_max": prob_info["cls_head_entropy_max"],
@@ -4098,6 +4199,7 @@ class ECPruner:
             )
             self._debug_qf_pruner(
                 f"prob_source={self.qfid_prob_source}, select_mode=qf, "
+                f"cls_prior_layers={self.last_qfid_info['cls_prior_layers']}, "
                 f"cls_attn_layer={self.last_qfid_info['cls_attn_layer']}, "
                 f"cls_head_reduce={self.last_qfid_info['cls_head_reduce']}, "
                 f"cls_attn_available={self.last_qfid_info['cls_attn_available']}, "
