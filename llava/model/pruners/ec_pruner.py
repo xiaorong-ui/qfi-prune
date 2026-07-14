@@ -538,6 +538,7 @@ def select_by_adaptive_core_recover(
     k,
     qfi_core_order,
     question_text=None,
+    cls_prior=None,
     eps=1e-12,
 ):
     """
@@ -593,6 +594,18 @@ def select_by_adaptive_core_recover(
             "residual_mass": 0.0,
             "k_core_original": 0,
             "k_recover_original": 0,
+            "restore_extra_prior": "none",
+            "restore_extra_lambda": 0.0,
+            "subspace_residual_mode": "fast",
+            "restore_extra_enabled": False,
+            "restore_extra_mean": 0.0,
+            "restore_extra_std": 0.0,
+            "restore_extra_min": 0.0,
+            "restore_extra_max": 0.0,
+            "restore_extra_norm_mean": 0.0,
+            "restore_extra_base_corr": 0.0,
+            "restore_extra_mean_g_res": 0.0,
+            "comp_score_mode": "current_anchor",
         }
         return torch.empty(0, dtype=torch.long, device=device), info
 
@@ -635,19 +648,39 @@ def select_by_adaptive_core_recover(
     }
     ratio_base = min(max(float(ratio_by_type.get(question_type, ratio_by_type["default"])), ratio_min), ratio_max)
 
+    entropy_gamma = max(_env_float("EC_QFICR_RECOVER_ENTROPY_GAMMA", "1.0"), safe_eps)
     entropy_gate = get_env_bool("EC_QFID_ADAPT_ENTROPY_GATE", default=True)
     if entropy_gate:
         low = _env_float("EC_QFID_ADAPT_ENTROPY_LOW", "0.70")
         high = _env_float("EC_QFID_ADAPT_ENTROPY_HIGH", "0.95")
         denom = max(high - low, safe_eps)
         u = min(max((entropy_norm - low) / denom, 0.0), 1.0)
-        recover_ratio = ratio_min + (ratio_base - ratio_min) * u
+        entropy_hat = min(max(float(u), 0.0), 1.0)
+        recover_ratio = ratio_min + (ratio_base - ratio_min) * (entropy_hat ** entropy_gamma)
     else:
+        entropy_hat = min(max(float(entropy_norm), 0.0), 1.0)
         recover_ratio = ratio_base
     recover_ratio = min(max(float(recover_ratio), ratio_min), ratio_max)
+    recover_ratio_requested = float(recover_ratio)
 
-    cap = max(0, _env_int("EC_QFID_ADAPT_RECOVER_CAP", "16"))
-    recover_num = min(max(int(round(select_num * recover_ratio)), 0), select_num, cap)
+    budget_mode = os.environ.get("EC_QFICR_RECOVER_BUDGET_MODE", "abs_cap").strip().lower()
+    if budget_mode not in {"abs_cap", "ratio_only", "ratio_cap"}:
+        budget_mode = "abs_cap"
+    abs_cap_default = os.environ.get("EC_QFID_ADAPT_RECOVER_CAP", "16")
+    abs_cap = max(0, _env_int("EC_QFICR_RECOVER_ABS_CAP", abs_cap_default))
+    ratio_cap = min(max(_env_float("EC_QFICR_RECOVER_RATIO_CAP", "0.25"), 0.0), 1.0)
+    raw_recover_num = max(int(round(select_num * recover_ratio)), 0)
+    cap_applied = False
+    if budget_mode == "abs_cap":
+        recover_num = min(raw_recover_num, abs_cap)
+        cap_applied = raw_recover_num > recover_num
+    elif budget_mode == "ratio_cap":
+        ratio_cap_num = max(int(round(select_num * ratio_cap)), 0)
+        recover_num = min(raw_recover_num, ratio_cap_num)
+        cap_applied = raw_recover_num > recover_num
+    else:
+        recover_num = raw_recover_num
+    recover_num = min(max(recover_num, 0), select_num)
     core_num = select_num - recover_num
 
     restoration_mode = os.environ.get("EC_QFICR_RESTORATION_MODE", "full").strip().lower()
@@ -665,6 +698,8 @@ def select_by_adaptive_core_recover(
         recover_ratio = fixed_restoration_ratio
         recover_num = min(max(int(round(select_num * fixed_restoration_ratio)), 0), select_num)
         core_num = select_num - recover_num
+    # EC_QFICR_YN_BUDGET_GATE scales yes/no recovery only. Setting it to 0
+    # means yes/no questions use no recovery and keep the full core budget.
     yn_budget_gate = min(max(_env_float("EC_QFICR_YN_BUDGET_GATE", "1.0"), 0.0), 1.0)
     yn_gate_applied = False
     if (
@@ -677,6 +712,7 @@ def select_by_adaptive_core_recover(
         core_num = select_num - recover_num
         recover_ratio = float(recover_num) / max(float(select_num), 1.0)
         yn_gate_applied = True
+        cap_applied = cap_applied or raw_recover_num > recover_num
 
     psi = F.normalize(
         torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0),
@@ -798,6 +834,15 @@ def select_by_adaptive_core_recover(
     prior_anchor = get_env_bool("EC_QFID_RECOVER_PRIOR_ANCHOR", default=True)
     prior_gamma = max(_env_float("EC_QFID_RECOVER_PRIOR_GAMMA", "0.5"), 0.0)
     anchor_alpha = max(_env_float("EC_QFICR_ANCHOR_ALPHA", str(prior_gamma)), 0.0)
+    comp_score_mode = os.environ.get("EC_QFICR_COMP_SCORE_MODE", "current_anchor").strip().lower()
+    if comp_score_mode not in {
+        "current_anchor",
+        "weak_anchor",
+        "no_anchor",
+        "marginal_gain_weak_gate",
+        "near_boundary_fill",
+    }:
+        comp_score_mode = "current_anchor"
     use_spatial_local_prior = get_env_bool("EC_QFICR_USE_SPATIAL_LOCAL_PRIOR", default=False)
     prior_ablation = os.environ.get("EC_QFICR_PRIOR_ABLATION", "full").strip().lower()
     if prior_ablation not in {"full", "no_spatial", "no_local", "none"}:
@@ -810,6 +855,24 @@ def select_by_adaptive_core_recover(
     rest_beta = max(_env_float("EC_QFICR_REST_BETA", "1.0"), safe_eps)
     restore_div_lambda = max(_env_float("EC_QFICR_RESTORE_DIV_LAMBDA", "0.0"), 0.0)
     restore_candidate_factor = max(_env_float("EC_QFICR_RESTORE_CANDIDATE_FACTOR", "2.0"), 1.0)
+    restore_extra_prior = os.environ.get("EC_QFICR_RESTORE_EXTRA_PRIOR", "none").strip().lower()
+    if restore_extra_prior not in {"none", "subspace_residual", "uncovered_cls", "context_anti"}:
+        restore_extra_prior = "none"
+    restore_extra_lambda = max(_env_float("EC_QFICR_RESTORE_EXTRA_LAMBDA", "0.0"), 0.0)
+    support_beta = max(_env_float("EC_QFICR_SUPPORT_BETA", "0.0"), 0.0)
+    self_discount = max(_env_float("EC_QFICR_SELF_DISCOUNT", "0.0"), 0.0)
+    subspace_residual_mode = os.environ.get("EC_QFICR_SUBSPACE_RESIDUAL_MODE", "fast").strip().lower()
+    if subspace_residual_mode not in {"fast", "full"}:
+        subspace_residual_mode = "fast"
+    restore_extra_enabled = (
+        restoration_mode == "full"
+        and restore_extra_prior != "none"
+        and restore_extra_lambda > 0.0
+    )
+    p_cls_vec = None
+    if torch.is_tensor(cls_prior) and cls_prior.numel() == num_tokens:
+        p_cls_vec = torch.nan_to_num(cls_prior.to(device=device).float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        p_cls_vec = p_cls_vec / p_cls_vec.sum().clamp_min(safe_eps)
     spatial_local_prior, spatial_prior, local_prior = _qficr_spatial_local_prior(
         num_tokens,
         core_indices,
@@ -818,6 +881,157 @@ def select_by_adaptive_core_recover(
         prior_ablation=prior_ablation,
     )
     random_seed = _env_int("EC_QFICR_RANDOM_SEED", "42")
+    qfi_rank = torch.full((num_tokens,), float("nan"), dtype=torch.float32, device=device)
+    if qfi_order.numel() > 0:
+        rank_vals = torch.arange(1, qfi_order.numel() + 1, dtype=torch.float32, device=device)
+        qfi_rank[qfi_order] = rank_vals
+
+    extra_stats = {
+        "restore_extra_mean": 0.0,
+        "restore_extra_std": 0.0,
+        "restore_extra_min": 0.0,
+        "restore_extra_max": 0.0,
+        "restore_extra_norm_mean": 0.0,
+        "restore_extra_base_corr": 0.0,
+        "restore_extra_mean_g_res": 0.0,
+    }
+    support = torch.zeros(num_tokens, dtype=torch.float32, device=device)
+    if support_beta > 0.0:
+        # Feature/evidence support excludes self contribution and does not use
+        # image coordinates or spatial-local priors.
+        support = (p[:, None] * evidence_kernel).sum(dim=0) - p
+        support = torch.nan_to_num(support.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+    core_coverage_for_marginal = coverage.clone()
+
+    def restoration_base_gain(current_coverage):
+        coverage_for_gain = core_coverage_for_marginal if comp_score_mode == "marginal_gain_weak_gate" else current_coverage
+        g_res_local = (p[:, None] * (evidence_kernel - coverage_for_gain[:, None]).clamp_min(0.0)).sum(dim=0)
+        if self_discount > 0.0:
+            self_gain_local = p * (1.0 - coverage_for_gain.clamp(0.0, 1.0)).clamp_min(0.0)
+            gain_local = (g_res_local - self_discount * self_gain_local).clamp_min(0.0)
+        else:
+            gain_local = g_res_local
+        if abs(rest_beta - 1.0) > 1e-12:
+            gain_local = gain_local.clamp_min(safe_eps).pow(rest_beta)
+        if comp_score_mode == "weak_anchor":
+            gain_local = gain_local * p.clamp_min(safe_eps).pow(0.25)
+        elif comp_score_mode == "no_anchor":
+            pass
+        elif comp_score_mode == "marginal_gain_weak_gate":
+            gain_local = gain_local * p.clamp_min(safe_eps).pow(0.1)
+        elif prior_anchor:
+            gain_local = gain_local * p.clamp_min(safe_eps).pow(anchor_alpha)
+        if support_beta > 0.0:
+            gain_local = gain_local * support.clamp_min(safe_eps).pow(support_beta)
+        if use_spatial_local_prior and prior_ablation != "none" and prior_lambda > 0.0:
+            # Legacy spatial/local prior remains disabled for the stable method
+            # and for replacement-prior experiments unless explicitly enabled.
+            gain_local = gain_local * (1.0 + prior_lambda * entropy_norm * spatial_local_prior)
+        return torch.nan_to_num(gain_local.float(), nan=0.0, posinf=0.0, neginf=0.0), torch.nan_to_num(
+            g_res_local.float(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+    def normalize_extra(extra, mask):
+        out = torch.zeros_like(extra, dtype=torch.float32, device=device)
+        if not bool(mask.any().item()):
+            return out
+        vals = torch.nan_to_num(extra[mask].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        v_min = vals.min()
+        v_max = vals.max()
+        denom = v_max - v_min
+        if not torch.isfinite(denom) or float(denom.abs().item()) <= safe_eps:
+            return out
+        out[mask] = ((vals - v_min) / denom).clamp(0.0, 1.0)
+        return out
+
+    def compute_restore_extra(g_res_local, base_gain_local, mask):
+        if not restore_extra_enabled:
+            return torch.zeros(num_tokens, dtype=torch.float32, device=device)
+        core_coverage = coverage.clamp(0.0, 1.0)
+        if restore_extra_prior == "subspace_residual":
+            # Replacement prior: fast residual state signal, 1 - c_j(S_red).
+            # It is aligned with QFi-CR's projection-overlap coverage and avoids
+            # reintroducing the previously harmful spatial/local prior.
+            if subspace_residual_mode == "full" and core_indices.numel() > 0:
+                basis = []
+                for idx_local in core_indices.tolist():
+                    v = psi[int(idx_local)]
+                    for b in basis:
+                        v = v - torch.dot(v, b) * b
+                    n = torch.linalg.vector_norm(v)
+                    if float(n.item()) > safe_eps:
+                        basis.append(v / n.clamp_min(safe_eps))
+                if basis:
+                    B = torch.stack(basis, dim=0)
+                    residual = psi - (psi @ B.t()) @ B
+                    extra = residual.pow(2).sum(dim=-1).clamp(0.0, 1.0)
+                else:
+                    extra = 1.0 - core_coverage
+            else:
+                extra = 1.0 - core_coverage
+        elif restore_extra_prior == "uncovered_cls":
+            cls_signal = p_cls_vec if p_cls_vec is not None else p
+            extra = cls_signal * (1.0 - core_coverage)
+        elif restore_extra_prior == "context_anti":
+            extra = (1.0 - p.clamp(0.0, 1.0)) * g_res_local.clamp_min(0.0)
+        else:
+            extra = torch.zeros(num_tokens, dtype=torch.float32, device=device)
+        extra = torch.nan_to_num(extra.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        norm_extra = normalize_extra(extra, mask)
+        if bool(mask.any().item()):
+            extra_vals = extra[mask]
+            norm_vals = norm_extra[mask]
+            base_vals = torch.nan_to_num(base_gain_local[mask].float(), nan=0.0, posinf=0.0, neginf=0.0)
+            extra_stats["restore_extra_mean"] = float(extra_vals.mean().item()) if extra_vals.numel() else 0.0
+            extra_stats["restore_extra_std"] = float(extra_vals.std(unbiased=False).item()) if extra_vals.numel() else 0.0
+            extra_stats["restore_extra_min"] = float(extra_vals.min().item()) if extra_vals.numel() else 0.0
+            extra_stats["restore_extra_max"] = float(extra_vals.max().item()) if extra_vals.numel() else 0.0
+            extra_stats["restore_extra_norm_mean"] = float(norm_vals.mean().item()) if norm_vals.numel() else 0.0
+            extra_stats["restore_extra_base_corr"] = _qficr_corr(norm_vals, base_vals, safe_eps) if norm_vals.numel() else 0.0
+            extra_stats["restore_extra_mean_g_res"] = float(g_res_local[mask].mean().item()) if g_res_local[mask].numel() else 0.0
+        return norm_extra
+
+    rest_selected_gain_values = []
+    rest_selected_res_values = []
+    rest_selected_support_values = []
+    rest_selected_self_values = []
+    rest_selected_p_values = []
+    rest_selected_core_overlap_values = []
+    rest_selected_qfi_rank_values = []
+
+    def append_restoration_debug(idx_local, gain_local, g_res_local, current_coverage):
+        if idx_local < 0 or idx_local >= num_tokens:
+            return
+        rest_selected_gain_values.append(float(torch.nan_to_num(gain_local[idx_local].float(), nan=0.0).item()))
+        rest_selected_res_values.append(float(torch.nan_to_num(g_res_local[idx_local].float(), nan=0.0).item()))
+        rest_selected_p_values.append(float(torch.nan_to_num(p[idx_local].float(), nan=0.0).item()))
+        if core_indices.numel() > 0:
+            overlap_val = evidence_kernel[idx_local, core_indices].max()
+        else:
+            overlap_val = torch.tensor(0.0, dtype=evidence_kernel.dtype, device=device)
+        rest_selected_core_overlap_values.append(float(torch.nan_to_num(overlap_val.float(), nan=0.0).item()))
+        rank_val = qfi_rank[idx_local]
+        if torch.isfinite(rank_val):
+            rest_selected_qfi_rank_values.append(float(rank_val.item()))
+        if support_beta > 0.0:
+            rest_selected_support_values.append(float(torch.nan_to_num(support[idx_local].float(), nan=0.0).item()))
+        self_gain_local = p[idx_local] * (1.0 - current_coverage[idx_local].clamp(0.0, 1.0)).clamp_min(0.0)
+        rest_selected_self_values.append(float(torch.nan_to_num(self_gain_local.float(), nan=0.0).item()))
+
+    if comp_score_mode == "near_boundary_fill" and recover_num > 0:
+        for idx_tensor in qfi_order.tolist():
+            idx = int(idx_tensor)
+            if len(selected) >= select_num:
+                break
+            if idx < 0 or idx >= num_tokens or not bool(available[idx].item()):
+                continue
+            gain, g_res = restoration_base_gain(coverage)
+            append_restoration_debug(idx, gain, g_res, coverage)
+            selected.append(idx)
+            available[idx] = False
+            candidate_mask[idx] = False
+            coverage = torch.maximum(coverage, evidence_kernel[:, idx])
 
     if restoration_mode == "random" and recover_num > 0:
         remaining_idx = torch.nonzero(available, as_tuple=False).reshape(-1)
@@ -829,18 +1043,14 @@ def select_by_adaptive_core_recover(
             selected.extend([int(x) for x in random_idx.tolist()])
             available[random_idx] = False
 
-    if restoration_mode == "full" and restore_div_lambda > 0.0 and recover_num > 0:
+    if comp_score_mode != "near_boundary_fill" and restoration_mode == "full" and restore_div_lambda > 0.0 and recover_num > 0:
         # Micro-tuning ablation: keep S_red fixed, build a small restoration
         # candidate pool by the normal residual gain, then greedily rerank with
         # a light kappa-based redundancy penalty. lambda=0 keeps the old path.
-        base_gain = (p[:, None] * (evidence_kernel - coverage[:, None]).clamp_min(0.0)).sum(dim=0)
-        if abs(rest_beta - 1.0) > 1e-12:
-            base_gain = base_gain.clamp_min(safe_eps).pow(rest_beta)
-        if prior_anchor:
-            base_gain = base_gain * p.clamp_min(safe_eps).pow(anchor_alpha)
-        if use_spatial_local_prior and prior_ablation != "none" and prior_lambda > 0.0:
-            base_gain = base_gain * (1.0 + prior_lambda * entropy_norm * spatial_local_prior)
-        base_gain = torch.nan_to_num(base_gain.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        base_gain, g_res = restoration_base_gain(coverage)
+        if restore_extra_enabled:
+            extra_norm = compute_restore_extra(g_res, base_gain, available & candidate_mask)
+            base_gain = base_gain * (1.0 + restore_extra_lambda * extra_norm)
         base_gain = base_gain.masked_fill(~available, float("-inf"))
         base_gain = base_gain.masked_fill(~candidate_mask, float("-inf"))
         pool_size = min(
@@ -865,42 +1075,34 @@ def select_by_adaptive_core_recover(
                 idx = int(torch.argmax(score).item())
                 if not bool(available[idx].item()) or not bool(pool_mask[idx].item()):
                     break
+                append_restoration_debug(idx, score, g_res, coverage)
                 selected.append(idx)
                 available[idx] = False
                 pool_mask[idx] = False
                 candidate_mask[idx] = False
                 coverage = torch.maximum(coverage, evidence_kernel[:, idx])
 
-    while len(selected) < select_num:
-        marginal = (evidence_kernel - coverage[:, None]).clamp_min(0.0)
-        gain = (p[:, None] * marginal).sum(dim=0)
-        if abs(rest_beta - 1.0) > 1e-12:
-            gain = gain.clamp_min(safe_eps).pow(rest_beta)
-        if prior_anchor:
-            gain = gain * p.clamp_min(safe_eps).pow(anchor_alpha)
-        if use_spatial_local_prior and prior_ablation != "none" and prior_lambda > 0.0:
-            # QFi-CR structural ablation: optional spatial-local b_j modulation
-            # for residual restoration gain. Defaults stay disabled to preserve
-            # existing qfi_adaptive_recover_prior behavior.
-            gain = gain * (1.0 + prior_lambda * entropy_norm * spatial_local_prior)
-        gain = torch.nan_to_num(gain.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    while comp_score_mode != "near_boundary_fill" and len(selected) < select_num:
+        gain, g_res = restoration_base_gain(coverage)
+        if restore_extra_enabled:
+            extra_norm = compute_restore_extra(g_res, gain, available & candidate_mask)
+            gain = gain * (1.0 + restore_extra_lambda * extra_norm)
+            gain = torch.nan_to_num(gain.float(), nan=0.0, posinf=0.0, neginf=0.0)
         gain = gain.masked_fill(~available, float("-inf"))
         gain = gain.masked_fill(~candidate_mask, float("-inf"))
         idx = int(torch.argmax(gain).item())
         if not bool(available[idx].item()) or not bool(candidate_mask[idx].item()):
             candidate_mask = available.clone()
-            gain = (p[:, None] * (evidence_kernel - coverage[:, None]).clamp_min(0.0)).sum(dim=0)
-            if abs(rest_beta - 1.0) > 1e-12:
-                gain = gain.clamp_min(safe_eps).pow(rest_beta)
-            if prior_anchor:
-                gain = gain * p.clamp_min(safe_eps).pow(anchor_alpha)
-            if use_spatial_local_prior and prior_ablation != "none" and prior_lambda > 0.0:
-                gain = gain * (1.0 + prior_lambda * entropy_norm * spatial_local_prior)
-            gain = torch.nan_to_num(gain.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            gain, g_res = restoration_base_gain(coverage)
+            if restore_extra_enabled:
+                extra_norm = compute_restore_extra(g_res, gain, available)
+                gain = gain * (1.0 + restore_extra_lambda * extra_norm)
+                gain = torch.nan_to_num(gain.float(), nan=0.0, posinf=0.0, neginf=0.0)
             gain = gain.masked_fill(~available, float("-inf"))
             idx = int(torch.argmax(gain).item())
             if not bool(available[idx].item()):
                 break
+        append_restoration_debug(idx, gain, g_res, coverage)
         selected.append(idx)
         available[idx] = False
         candidate_mask[idx] = False
@@ -910,16 +1112,92 @@ def select_by_adaptive_core_recover(
         filler = torch.nonzero(available, as_tuple=False).reshape(-1)
         selected.extend(filler[: select_num - len(selected)].tolist())
 
+    selected_limited = selected[:select_num]
+    core_count = min(core_num, len(selected_limited))
+    core_selected = selected_limited[:core_count]
+    rest_selected = selected_limited[core_count:]
+
+    def _mean_indices(vec, indices):
+        if not indices:
+            return None
+        idx_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+        vals = torch.nan_to_num(vec[idx_tensor].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        return float(vals.mean().item()) if vals.numel() else None
+
+    def _mean_list(values):
+        return float(sum(values) / len(values)) if values else None
+
+    def _median_list(values):
+        if not values:
+            return None
+        vals = sorted(float(v) for v in values)
+        mid = len(vals) // 2
+        if len(vals) % 2:
+            return vals[mid]
+        return 0.5 * (vals[mid - 1] + vals[mid])
+
+    def _values_at(vec, indices):
+        if not indices:
+            return []
+        idx_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+        vals = torch.nan_to_num(vec[idx_tensor].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        return [float(v) for v in vals.tolist()]
+
+    def _rank_values(indices):
+        vals = []
+        for idx_local in indices:
+            rank_val = qfi_rank[int(idx_local)]
+            if torch.isfinite(rank_val):
+                vals.append(float(rank_val.item()))
+        return vals
+
+    def _max_core_overlap_values(indices):
+        if not indices:
+            return []
+        if core_indices.numel() <= 0:
+            return [0.0 for _ in indices]
+        idx_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+        vals = evidence_kernel[idx_tensor][:, core_indices].max(dim=1).values
+        vals = torch.nan_to_num(vals.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        return [float(v) for v in vals.tolist()]
+
+    if core_indices.numel() > 0:
+        diagnostic_core_coverage = evidence_kernel[:, core_indices].max(dim=1).values
+    else:
+        diagnostic_core_coverage = torch.zeros(num_tokens, dtype=evidence_kernel.dtype, device=device)
+    diagnostic_g_res = (p[:, None] * (evidence_kernel - diagnostic_core_coverage[:, None]).clamp_min(0.0)).sum(dim=0)
+    rest_set = set(int(x) for x in rest_selected)
+    core_set = set(int(x) for x in core_selected)
+    discarded = [int(i) for i in range(num_tokens) if int(i) not in rest_set and int(i) not in core_set]
+    discarded_p_values = _values_at(p, discarded)
+    discarded_res_values = _values_at(diagnostic_g_res, discarded)
+    discarded_overlap_values = _max_core_overlap_values(discarded)
+    discarded_rank_values = _rank_values(discarded)
+    near_boundary_threshold = float(select_num + max(1, recover_num) * 2)
+    near_boundary_hits = [1.0 for v in rest_selected_qfi_rank_values if v <= near_boundary_threshold]
+
     info = {
         "adapt_mode": adapt_mode,
         "question_type": question_type,
+        "entropy": float(entropy.item()),
         "entropy_norm": entropy_norm,
+        "recover_ratio_min": float(ratio_min),
+        "recover_ratio_max": float(ratio_max),
+        "recover_ratio_requested": float(recover_ratio_requested),
         "recover_ratio": recover_ratio,
+        "recover_budget_mode": budget_mode,
+        "recover_abs_cap": int(abs_cap),
+        "recover_ratio_cap": float(ratio_cap),
+        "recover_entropy_gamma": float(entropy_gamma),
+        "recover_entropy_hat": float(entropy_hat),
+        "recover_raw_k": int(raw_recover_num),
+        "recover_cap_applied": bool(cap_applied),
         "k_core": min(core_num, len(selected)),
         "k_recover": max(0, min(select_num, len(selected)) - min(core_num, len(selected))),
         "recover_prior_anchor": bool(prior_anchor),
         "recover_prior_gamma": float(prior_gamma),
         "anchor_alpha": float(anchor_alpha),
+        "comp_score_mode": comp_score_mode,
         "recover_cand_pool": bool(cand_pool_enabled),
         "recover_cand_mult": float(cand_mult),
         "recover_cand_size": int(candidate_size),
@@ -930,6 +1208,8 @@ def select_by_adaptive_core_recover(
         "prior_ablation": prior_ablation,
         "prior_lambda": float(prior_lambda),
         "rest_beta": float(rest_beta),
+        "support_beta": float(support_beta),
+        "self_discount": float(self_discount),
         "obs_temperature": float(obs_temperature),
         "restore_div_lambda": float(restore_div_lambda),
         "restore_candidate_factor": float(restore_candidate_factor),
@@ -942,10 +1222,37 @@ def select_by_adaptive_core_recover(
         "residual_mass": float(residual_mass),
         "k_core_original": int(k_core_original),
         "k_recover_original": int(k_recover_original),
+        "restore_extra_prior": restore_extra_prior,
+        "restore_extra_lambda": float(restore_extra_lambda),
+        "subspace_residual_mode": subspace_residual_mode,
+        "restore_extra_enabled": bool(restore_extra_enabled),
+        **extra_stats,
         "random_seed": int(random_seed),
         "spatial_prior_mean": float(spatial_prior.mean().item()) if spatial_prior.numel() > 0 else 0.0,
         "local_prior_mean": float(local_prior.mean().item()) if local_prior.numel() > 0 else 0.0,
         "spatial_local_prior_mean": float(spatial_local_prior.mean().item()) if spatial_local_prior.numel() > 0 else 0.0,
+        "mean_p_core": _mean_indices(p, core_selected),
+        "mean_p_rest": _mean_indices(p, rest_selected),
+        "median_p_rest": _median_list(rest_selected_p_values),
+        "mean_residual_gain_rest": _mean_list(rest_selected_res_values),
+        "median_residual_gain_rest": _median_list(rest_selected_res_values),
+        "mean_max_overlap_to_core_rest": _mean_list(rest_selected_core_overlap_values),
+        "median_max_overlap_to_core_rest": _median_list(rest_selected_core_overlap_values),
+        "mean_qfi_rank_rest": _mean_list(rest_selected_qfi_rank_values),
+        "median_qfi_rank_rest": _median_list(rest_selected_qfi_rank_values),
+        "near_boundary_rank_threshold": near_boundary_threshold,
+        "near_boundary_rank_hit_rate": None if not rest_selected_qfi_rank_values else float(len(near_boundary_hits) / len(rest_selected_qfi_rank_values)),
+        "mean_p_discarded": _mean_list(discarded_p_values),
+        "median_p_discarded": _median_list(discarded_p_values),
+        "mean_residual_gain_discarded": _mean_list(discarded_res_values),
+        "median_residual_gain_discarded": _median_list(discarded_res_values),
+        "mean_max_overlap_to_core_discarded": _mean_list(discarded_overlap_values),
+        "median_max_overlap_to_core_discarded": _median_list(discarded_overlap_values),
+        "mean_qfi_rank_discarded": _mean_list(discarded_rank_values),
+        "median_qfi_rank_discarded": _median_list(discarded_rank_values),
+        "mean_support_rest": _mean_list(rest_selected_support_values),
+        "mean_self_gain_rest": _mean_list(rest_selected_self_values),
+        "mean_restoration_score_rest": _mean_list(rest_selected_gain_values),
     }
     debug_prior_path = os.environ.get("EC_QFICR_DEBUG_PRIOR_STATS_JSONL", "").strip()
     if debug_prior_path:
@@ -2512,32 +2819,82 @@ class ECPruner:
     def _write_qfid_debug_stats(self, info):
         """Append optional QF diagnostics without changing the selection path."""
         global _QFID_STATS_COUNT
-        if not self.qfid_debug_stats_jsonl or not (
-            info.get("cls_gate_enabled", False) or info.get("budget_calib", False)
-        ):
+        if not self.qfid_debug_stats_jsonl:
             return
 
-        output_dir = os.path.dirname(os.path.abspath(self.qfid_debug_stats_jsonl))
+        stats_path = self.qfid_debug_stats_jsonl
+        if stats_path.lower() in {"1", "true", "yes", "on"}:
+            stats_path = os.path.abspath("debug_qficr_stats.jsonl")
+        output_dir = os.path.dirname(os.path.abspath(stats_path))
         os.makedirs(output_dir, exist_ok=True)
+
+        def _float_or_none(value):
+            if value is None:
+                return None
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) else None
+
+        def _int_or_none(value):
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        question_type = info.get("question_type", "")
         record = {
             "sample_index": _QFID_STATS_COUNT,
             "process_id": os.getpid(),
-            "agreement": float(info["agreement"]),
-            "js_div": float(info["js_div"]),
-            "gate": float(info["gate"]),
-            "beta_eff": float(info["beta_eff"]),
-            "beta_base": float(info["beta_base"]),
-            "p_sem_entropy": float(info["p_sem_entropy"]),
-            "p_cls_entropy": float(info["p_cls_entropy"]),
-            "keep_size": int(info["keep_size"]),
+            "benchmark": os.environ.get("EC_QFID_DEBUG_BENCHMARK", ""),
+            "question_id": os.environ.get("EC_QFID_DEBUG_QUESTION_ID", ""),
+            "question_type": question_type,
+            "is_yes_no": bool(question_type == "binary"),
+            "K": _int_or_none(info.get("final_keep_size", info.get("keep_size"))),
+            "N": _int_or_none(info.get("num_tokens")),
+            "budget_mode": info.get("qficr_budget_mode"),
+            "rho_min": _float_or_none(info.get("qficr_rho_min")),
+            "rho_max": _float_or_none(info.get("qficr_rho_max")),
+            "entropy": _float_or_none(info.get("qficr_entropy", info.get("entropy"))),
+            "entropy_norm": _float_or_none(info.get("qficr_entropy_norm", info.get("entropy_norm"))),
+            "entropy_hat": _float_or_none(info.get("qficr_entropy_hat")),
+            "entropy_gamma": _float_or_none(info.get("qficr_entropy_gamma")),
+            "rho": _float_or_none(info.get("qficr_rho", info.get("adapt_recover_ratio"))),
+            "raw_k_rest": _int_or_none(info.get("qficr_raw_k_rest")),
+            "final_k_rest": _int_or_none(info.get("qficr_final_k_rest", info.get("adapt_k_recover"))),
+            "final_k_red": _int_or_none(info.get("qficr_final_k_red", info.get("adapt_k_core"))),
+            "abs_cap": _int_or_none(info.get("qficr_abs_cap")),
+            "ratio_cap": _float_or_none(info.get("qficr_ratio_cap")),
+            "cap_applied": bool(info.get("qficr_cap_applied", False)),
+            "yes_no_gate_applied": bool(info.get("qficr_yes_no_gate_applied", False)),
+            "anchor_alpha": _float_or_none(info.get("qficr_anchor_alpha")),
+            "support_beta": _float_or_none(info.get("qficr_support_beta")),
+            "self_discount": _float_or_none(info.get("qficr_self_discount")),
+            "mean_p_core": _float_or_none(info.get("qficr_mean_p_core")),
+            "mean_p_rest": _float_or_none(info.get("qficr_mean_p_rest")),
+            "mean_residual_gain_rest": _float_or_none(info.get("qficr_mean_residual_gain_rest")),
+            "mean_support_rest": _float_or_none(info.get("qficr_mean_support_rest")),
+            "mean_self_gain_rest": _float_or_none(info.get("qficr_mean_self_gain_rest")),
+            "mean_restoration_score_rest": _float_or_none(info.get("qficr_mean_restoration_score_rest")),
+            "agreement": _float_or_none(info.get("agreement")),
+            "js_div": _float_or_none(info.get("js_div")),
+            "gate": _float_or_none(info.get("gate")),
+            "beta_eff": _float_or_none(info.get("beta_eff")),
+            "beta_base": _float_or_none(info.get("beta_base")),
+            "p_sem_entropy": _float_or_none(info.get("p_sem_entropy")),
+            "p_cls_entropy": _float_or_none(info.get("p_cls_entropy")),
+            "keep_size": _int_or_none(info.get("keep_size")),
             "budget_calib": bool(info.get("budget_calib", False)),
-            "budget_alpha": float(info.get("budget_alpha", self.qfid_budget_alpha)),
-            "budget_target_neff": float(info.get("budget_target_neff", 0.0)),
-            "budget_neff_before": float(info.get("budget_neff_before", 0.0)),
-            "budget_neff_after": float(info.get("budget_neff_after", 0.0)),
-            "budget_gamma": float(info.get("budget_gamma", 1.0)),
+            "budget_alpha": _float_or_none(info.get("budget_alpha", self.qfid_budget_alpha)),
+            "budget_target_neff": _float_or_none(info.get("budget_target_neff", 0.0)),
+            "budget_neff_before": _float_or_none(info.get("budget_neff_before", 0.0)),
+            "budget_neff_after": _float_or_none(info.get("budget_neff_after", 0.0)),
+            "budget_gamma": _float_or_none(info.get("budget_gamma", 1.0)),
         }
-        with open(self.qfid_debug_stats_jsonl, "a", encoding="utf-8") as stats_file:
+        with open(stats_path, "a", encoding="utf-8") as stats_file:
             stats_file.write(json.dumps(record, sort_keys=True) + "\n")
         _QFID_STATS_COUNT += 1
 
@@ -3179,6 +3536,11 @@ class ECPruner:
             cls_attn=cls_attn,
             semantic_response_source=semantic_response_source,
         )
+        cls_prior_for_restore = None
+        if self.qfid_prob_source in {"clsmix", "cls_only_qf"} or os.environ.get(
+            "EC_QFICR_RESTORE_EXTRA_PRIOR", "none"
+        ).strip().lower() == "uncovered_cls":
+            cls_prior_for_restore, _ = self.compute_qfid_cls_probability(cls_attn, num_tokens, device)
         safe_probs = probs.clamp_min(max(float(self.qfid_budget_eps), eps))
         safe_probs = safe_probs / safe_probs.sum().clamp_min(max(float(self.qfid_budget_eps), eps))
         neff_before = float(torch.exp(-(safe_probs * safe_probs.log()).sum()).item())
@@ -3394,6 +3756,17 @@ class ECPruner:
             "spatial_prior_mean": 0.0,
             "local_prior_mean": 0.0,
             "spatial_local_prior_mean": 0.0,
+            "restore_extra_prior": "none",
+            "restore_extra_lambda": 0.0,
+            "subspace_residual_mode": "fast",
+            "restore_extra_enabled": False,
+            "restore_extra_mean": 0.0,
+            "restore_extra_std": 0.0,
+            "restore_extra_min": 0.0,
+            "restore_extra_max": 0.0,
+            "restore_extra_norm_mean": 0.0,
+            "restore_extra_base_corr": 0.0,
+            "restore_extra_mean_g_res": 0.0,
         }
         qmo_cr_info = {
             "qmo_cr_enabled": False,
@@ -3511,6 +3884,7 @@ class ECPruner:
                 k=K,
                 qfi_core_order=qfi_residual_order,
                 question_text=question,
+                cls_prior=cls_prior_for_restore,
                 eps=eps,
             )
             core_ratio_used = 1.0 - float(adaptive_info["recover_ratio"])
@@ -3795,6 +4169,21 @@ class ECPruner:
             "adapt_recover_ratio": adaptive_info["recover_ratio"],
             "adapt_k_core": adaptive_info["k_core"],
             "adapt_k_recover": adaptive_info["k_recover"],
+            "qficr_budget_mode": adaptive_info.get("recover_budget_mode", "abs_cap"),
+            "qficr_rho_min": adaptive_info.get("recover_ratio_min", adaptive_info.get("ratio_min", 0.0)),
+            "qficr_rho_max": adaptive_info.get("recover_ratio_max", adaptive_info.get("ratio_max", 0.25)),
+            "qficr_entropy": adaptive_info.get("entropy", prob_info["entropy"]),
+            "qficr_entropy_norm": adaptive_info.get("entropy_norm", prob_info["entropy_norm"]),
+            "qficr_entropy_hat": adaptive_info.get("recover_entropy_hat", adaptive_info.get("entropy_norm", 0.0)),
+            "qficr_entropy_gamma": adaptive_info.get("recover_entropy_gamma", 1.0),
+            "qficr_rho": adaptive_info.get("recover_ratio_requested", adaptive_info["recover_ratio"]),
+            "qficr_raw_k_rest": adaptive_info.get("recover_raw_k", adaptive_info["k_recover"]),
+            "qficr_final_k_rest": adaptive_info["k_recover"],
+            "qficr_final_k_red": adaptive_info["k_core"],
+            "qficr_abs_cap": adaptive_info.get("recover_abs_cap", 16),
+            "qficr_ratio_cap": adaptive_info.get("recover_ratio_cap", 0.25),
+            "qficr_cap_applied": adaptive_info.get("recover_cap_applied", False),
+            "qficr_yes_no_gate_applied": adaptive_info.get("yn_gate_applied", False),
             "recover_prior_anchor": adaptive_info["recover_prior_anchor"],
             "recover_prior_gamma": adaptive_info["recover_prior_gamma"],
             "recover_cand_pool": adaptive_info["recover_cand_pool"],
@@ -3807,10 +4196,46 @@ class ECPruner:
             "qficr_prior_ablation": adaptive_info.get("prior_ablation", "none"),
             "qficr_prior_lambda": adaptive_info.get("prior_lambda", 0.0),
             "qficr_anchor_alpha": adaptive_info.get("anchor_alpha", adaptive_info.get("recover_prior_gamma", 0.0)),
+            "qficr_support_beta": adaptive_info.get("support_beta", 0.0),
+            "qficr_self_discount": adaptive_info.get("self_discount", 0.0),
+            "qficr_mean_p_core": adaptive_info.get("mean_p_core"),
+            "qficr_mean_p_rest": adaptive_info.get("mean_p_rest"),
+            "qficr_median_p_rest": adaptive_info.get("median_p_rest"),
+            "qficr_mean_residual_gain_rest": adaptive_info.get("mean_residual_gain_rest"),
+            "qficr_median_residual_gain_rest": adaptive_info.get("median_residual_gain_rest"),
+            "qficr_mean_max_overlap_to_core_rest": adaptive_info.get("mean_max_overlap_to_core_rest"),
+            "qficr_median_max_overlap_to_core_rest": adaptive_info.get("median_max_overlap_to_core_rest"),
+            "qficr_mean_qfi_rank_rest": adaptive_info.get("mean_qfi_rank_rest"),
+            "qficr_median_qfi_rank_rest": adaptive_info.get("median_qfi_rank_rest"),
+            "qficr_near_boundary_rank_threshold": adaptive_info.get("near_boundary_rank_threshold"),
+            "qficr_near_boundary_rank_hit_rate": adaptive_info.get("near_boundary_rank_hit_rate"),
+            "qficr_mean_p_discarded": adaptive_info.get("mean_p_discarded"),
+            "qficr_median_p_discarded": adaptive_info.get("median_p_discarded"),
+            "qficr_mean_residual_gain_discarded": adaptive_info.get("mean_residual_gain_discarded"),
+            "qficr_median_residual_gain_discarded": adaptive_info.get("median_residual_gain_discarded"),
+            "qficr_mean_max_overlap_to_core_discarded": adaptive_info.get("mean_max_overlap_to_core_discarded"),
+            "qficr_median_max_overlap_to_core_discarded": adaptive_info.get("median_max_overlap_to_core_discarded"),
+            "qficr_mean_qfi_rank_discarded": adaptive_info.get("mean_qfi_rank_discarded"),
+            "qficr_median_qfi_rank_discarded": adaptive_info.get("median_qfi_rank_discarded"),
+            "qficr_mean_support_rest": adaptive_info.get("mean_support_rest"),
+            "qficr_mean_self_gain_rest": adaptive_info.get("mean_self_gain_rest"),
+            "qficr_mean_restoration_score_rest": adaptive_info.get("mean_restoration_score_rest"),
+            "qficr_comp_score_mode": adaptive_info.get("comp_score_mode", "current_anchor"),
             "qficr_random_seed": adaptive_info.get("random_seed", 42),
             "qficr_spatial_prior_mean": adaptive_info.get("spatial_prior_mean", 0.0),
             "qficr_local_prior_mean": adaptive_info.get("local_prior_mean", 0.0),
             "qficr_spatial_local_prior_mean": adaptive_info.get("spatial_local_prior_mean", 0.0),
+            "qficr_restore_extra_prior": adaptive_info.get("restore_extra_prior", "none"),
+            "qficr_restore_extra_lambda": adaptive_info.get("restore_extra_lambda", 0.0),
+            "qficr_subspace_residual_mode": adaptive_info.get("subspace_residual_mode", "fast"),
+            "qficr_restore_extra_enabled": adaptive_info.get("restore_extra_enabled", False),
+            "qficr_restore_extra_mean": adaptive_info.get("restore_extra_mean", 0.0),
+            "qficr_restore_extra_std": adaptive_info.get("restore_extra_std", 0.0),
+            "qficr_restore_extra_min": adaptive_info.get("restore_extra_min", 0.0),
+            "qficr_restore_extra_max": adaptive_info.get("restore_extra_max", 0.0),
+            "qficr_restore_extra_norm_mean": adaptive_info.get("restore_extra_norm_mean", 0.0),
+            "qficr_restore_extra_base_corr": adaptive_info.get("restore_extra_base_corr", 0.0),
+            "qficr_restore_extra_mean_g_res": adaptive_info.get("restore_extra_mean_g_res", 0.0),
             "qmo_cr_enabled": qmo_cr_info["qmo_cr_enabled"],
             "qmo_entropy": qmo_cr_info["entropy"],
             "qmo_purity": qmo_cr_info["purity"],
@@ -4152,6 +4577,22 @@ class ECPruner:
             f"adapt_k_core={self.last_qfid_info['adapt_k_core']}, "
             f"adapt_k_recover={self.last_qfid_info['adapt_k_recover']}, "
             f"question_text_available={self.last_qfid_info['question_text_available']}"
+        )
+        self._debug_qf_pruner(
+            f"budget_mode={self.last_qfid_info['qficr_budget_mode']}, "
+            f"K={self.last_qfid_info['final_keep_size']}, "
+            f"rho_min={self.last_qfid_info['qficr_rho_min']:.6f}, "
+            f"rho_max={self.last_qfid_info['qficr_rho_max']:.6f}, "
+            f"H_hat={self.last_qfid_info['qficr_entropy_hat']:.6f}, "
+            f"entropy_gamma={self.last_qfid_info['qficr_entropy_gamma']:.6f}, "
+            f"rho={self.last_qfid_info['qficr_rho']:.6f}, "
+            f"raw_K_rest={self.last_qfid_info['qficr_raw_k_rest']}, "
+            f"final_K_rest={self.last_qfid_info['qficr_final_k_rest']}, "
+            f"final_K_red={self.last_qfid_info['qficr_final_k_red']}, "
+            f"abs_cap={self.last_qfid_info['qficr_abs_cap']}, "
+            f"ratio_cap={self.last_qfid_info['qficr_ratio_cap']:.6f}, "
+            f"cap_applied={self.last_qfid_info['qficr_cap_applied']}, "
+            f"yes_no_gate_applied={self.last_qfid_info['qficr_yes_no_gate_applied']}"
         )
         self._debug_qf_pruner(
             f"recover_prior_anchor={self.last_qfid_info['recover_prior_anchor']}, "

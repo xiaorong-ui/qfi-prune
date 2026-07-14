@@ -19,6 +19,7 @@ datasets/
 data/
 tmp/
 cache/
+.cache/
 
 *.pt
 *.pth
@@ -70,6 +71,19 @@ playground/data/eval/
 *.npy
 *.npz
 *.pkl
+*.log
+*.out
+*.jsonl
+*.tar
 *.zip
 
 *.tex
+
+# local secrets
+secrets/
+secrets/api.yaml
+api.yaml
+*.key
+*.secret
+*.pem
+.env

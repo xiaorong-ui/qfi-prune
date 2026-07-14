@@ -16,6 +16,17 @@ from PIL import Image
 import math
 
 
+def configure_qficr_debug_stats(answers_file):
+    value = os.environ.get("EC_QFID_DEBUG_STATS_JSONL", "").strip()
+    if not value:
+        return
+    if value.lower() in {"1", "true", "yes", "on"}:
+        value = os.path.join(os.path.dirname(os.path.abspath(answers_file)), "debug_qficr_stats.jsonl")
+        os.environ["EC_QFID_DEBUG_STATS_JSONL"] = value
+    if os.path.exists(value):
+        os.remove(value)
+
+
 all_options = ['A', 'B', 'C', 'D']
 
 
@@ -56,6 +67,9 @@ def eval_model(args):
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
+    answers_file = os.path.expanduser(args.answers_file)
+    os.makedirs(os.path.dirname(answers_file), exist_ok=True)
+    configure_qficr_debug_stats(answers_file)
 
     tokenizer, model, image_processor, context_len = load_pretrained_model(
         model_path, args.model_base, model_name,
@@ -65,8 +79,6 @@ def eval_model(args):
     # Data
     questions = pd.read_table(os.path.expanduser(args.question_file))
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
-    answers_file = os.path.expanduser(args.answers_file)
-    os.makedirs(os.path.dirname(answers_file), exist_ok=True)
     ans_file = open(answers_file, "w")
 
     if 'plain' in model_name and 'finetune' not in model_name.lower() and 'mmtag' not in args.conv_mode:
@@ -85,6 +97,7 @@ def eval_model(args):
 
         for round_idx in range(num_rounds):
             idx = row['index']
+            os.environ["EC_QFID_DEBUG_QUESTION_ID"] = str(idx)
             question = row['question']
             hint = row['hint']
             image = load_image_from_base64(row['image'])
